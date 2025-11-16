@@ -1,5 +1,6 @@
+streamlit
 simpy
 pandas
 numpy
 openpyxl
-streamlit
+matplotlib
