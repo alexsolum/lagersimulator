@@ -1,0 +1,5 @@
+simpy
+pandas
+numpy
+openpyxl
+streamlit
