@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import math
 import matplotlib.pyplot as plt
+import plotly.express as px
 
 ###############################################################
 #               TIDSMODELL – VIKTIG!
@@ -56,7 +57,8 @@ def travel_time(coord_map, a, b):
 ###############################################################
 # PICKER-PROSESS
 ###############################################################
-def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap, stats):
+def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap,
+           stats, article_locations, location_resources, location_stock):
     current = None
     total = 0
     log.append(f"Picker {pid} startet {env.now:.2f} min")
@@ -72,19 +74,45 @@ def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap, stats):
             break
 
         order_id = item["order_id"]
-        locs = item["order_list"]
+        order_articles = item["order_list"]
 
         log.append(f"Picker {pid} starter {order_id} ved {env.now:.2f}")
 
-        if current is None:
-            current = locs[0]
+        for article in order_articles:
+            # Finn første ledige lokasjon med beholdning
+            candidates = [loc for loc in article_locations.get(article, [])
+                          if location_stock.get(loc, 0) > 0]
+            if not candidates:
+                log.append(f"Picker {pid} fant ingen lagerbeholdning for {article}")
+                continue
 
-        for nxt in locs:
-            t_travel = travel_time(coord_map, current, nxt)
-            dist = 0
+            chosen = None
+            req = None
 
+            for loc in candidates:
+                res = location_resources[loc]
+                if res.count < res.capacity and len(res.queue) == 0:
+                    chosen = loc
+                    req = res.request()
+                    break
+
+            if chosen is None:
+                chosen = candidates[0]
+                req = location_resources[chosen].request()
+
+            yield req
+
+            if location_stock.get(chosen, 0) <= 0:
+                location_resources[chosen].release(req)
+                log.append(f"Picker {pid} ventet på {article}, men lokasjon {chosen} var tom")
+                continue
+
+            if current is None:
+                current = chosen
+
+            t_travel = travel_time(coord_map, current, chosen)
             (x1, y1) = coord_map[current]
-            (x2, y2) = coord_map[nxt]
+            (x2, y2) = coord_map[chosen]
             dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
             stats[pid]["distance_m"] += dist
 
@@ -98,15 +126,22 @@ def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap, stats):
             yield env.timeout(t_travel)
             total += t_travel
 
-            px, py = coord_map[nxt]
+            px, py = coord_map[chosen]
             mv_log.append((env.now, pid, px, py))
 
-            heatmap[nxt] = heatmap.get(nxt, 0) + 1
+            heatmap[chosen] = heatmap.get(chosen, 0) + 1
 
             yield env.timeout(pick_time)
             total += pick_time
 
-            current = nxt
+            location_stock[chosen] -= 1
+            location_resources[chosen].release(req)
+
+            log.append(
+                f"Picker {pid} plukket {article} fra {chosen} ved {env.now:.2f}"
+            )
+
+            current = chosen
 
         log.append(f"Picker {pid} ferdig {order_id} ved {env.now:.2f}")
 
@@ -128,20 +163,31 @@ def order_manager(env, store, orders, num_pickers):
 # KJØR EN HEL SIMULERING
 ###############################################################
 def run_simulation(df_loc, df_orders, num_pickers):
+    env = simpy.Environment()
+
     coord_map = {}
-    art_to_loc = {}
+    article_locations = {}
+    location_stock = {}
+    location_resources = {}
 
     for _, r in df_loc.iterrows():
         loc = int(r["lokasjon"])
         coord_map[loc] = (float(r["x"]), float(r["y"]))
-        art_to_loc[r["artikkel"]] = loc
+        article_locations.setdefault(r["artikkel"], []).append(loc)
+        location_stock[loc] = location_stock.get(loc, 0) + (
+            int(r["antall"]) if "antall" in df_loc.columns else 1
+        )
+        location_resources[loc] = simpy.Resource(env, capacity=1)
+
+    for locations in article_locations.values():
+        locations.sort()
 
     orders = []
     for oid, g in df_orders.groupby("ordre"):
-        lst = [art_to_loc[a] for a in g["artikkel"] if a in art_to_loc]
-        orders.append(lst)
+        lst = [a for a in g["artikkel"] if a in article_locations]
+        if lst:
+            orders.append(lst)
 
-    env = simpy.Environment()
     store = simpy.Store(env)
 
     log = []
@@ -165,7 +211,8 @@ def run_simulation(df_loc, df_orders, num_pickers):
 
         env.process(
             picker(env, pid, store, coord_map,
-                   pick_time_min, log, mv_log, heatmap, stats)
+                   pick_time_min, log, mv_log, heatmap, stats,
+                   article_locations, location_resources, location_stock)
         )
 
     env.process(order_manager(env, store, orders, num_pickers))
@@ -206,6 +253,9 @@ num_pickers = st.number_input(
 num_layouts = st.number_input("Hvor mange layouter vil du sammenligne?", 1, 5, 2)
 uploaded = {}
 
+if "scenarios" not in st.session_state:
+    st.session_state["scenarios"] = None
+
 for i in range(num_layouts):
     uploaded[i] = st.file_uploader(f"Last opp Layout {i+1}", type=["xlsx"], key=f"layout{i}")
 
@@ -224,8 +274,13 @@ if run:
         st.write(f"⏳ Kjører layout {i+1}…")
         scenarios[f"Layout {i+1}"] = run_simulation(df_loc, df_orders, num_pickers)
 
-    st.success("Alle layout-simuleringer fullført!")
+    st.session_state["scenarios"] = scenarios
 
+    st.success("Alle layout-simuleringer fullført! Scroll ned for resultater.")
+
+scenarios = st.session_state.get("scenarios")
+
+if scenarios:
     ###############################################################
     # TABS FOR VISUALISERING
     ###############################################################
@@ -256,6 +311,11 @@ if run:
             loc_df = pd.DataFrame(
                 [{"loc": k, "x": coord_map[k][0], "y": coord_map[k][1]} for k in coord_map]
             )
+
+            x_padding = 1
+            y_padding = 1
+            x_range = [loc_df["x"].min() - x_padding, loc_df["x"].max() + x_padding]
+            y_range = [loc_df["y"].min() - y_padding, loc_df["y"].max() + y_padding]
 
             # LAYOUTTEGNING
             st.subheader("🏗️ Lagerlayout")
@@ -291,11 +351,31 @@ if run:
             plt.colorbar(sc, ax=ax2)
             st.pyplot(fig2)
 
-            # ANIMASJON
-            st.subheader("🎥 Animasjon")
+            # PLOTLY-ANIMASJON
+            st.subheader("🎬 Interaktiv animasjon (Plotly)")
+            mv_plot = mv.copy()
+            mv_plot["tid (min)"] = mv_plot["time"].round(2)
+            mv_plot.sort_values("time", inplace=True)
+            fig_plotly = px.scatter(
+                mv_plot,
+                x="x",
+                y="y",
+                color="picker",
+                animation_frame="tid (min)",
+                animation_group="picker",
+                range_x=x_range,
+                range_y=y_range,
+                labels={"x": "X (m)", "y": "Y (m)", "picker": "Plukker"},
+                title="Plukkerbevegelser over tid"
+            )
+            fig_plotly.update_traces(marker=dict(size=10))
+            st.plotly_chart(fig_plotly, use_container_width=True)
+
+            # ANIMASJON (MATPLOTLIB-SLIDER)
+            st.subheader("🎥 Animasjon med tids-slider")
             max_t = mv["time"].max()
             t_sel = st.slider(f"Tidspunkt – {name}", 0.0, float(max_t),
-                              0.0, step=max_t/200, key=f"slider_{name}")
+                              0.0, step=max(0.01, max_t/200), key=f"slider_{name}")
             st.write(f"⏱ {format_time(t_sel * 60)}")
 
             frame = mv[mv["time"] <= t_sel]
@@ -337,3 +417,5 @@ if run:
             for name, res in scenarios.items()
         ])
         st.bar_chart(queue_df.set_index("Layout"))
+else:
+    st.info("Last opp Excel-filer og trykk på \"Kjør simulering\" for å starte.")
