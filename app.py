@@ -755,7 +755,7 @@ def main():
                             showlegend=False,
                         )
                     )
-                    st.plotly_chart(layout_fig, use_container_width=True)
+                    st.plotly_chart(layout_fig, width="stretch", key=f"layout_fig_{name}")
 
                     # SPOR
                     st.subheader("📍 Plukkernes spor")
@@ -780,7 +780,7 @@ def main():
                         template="plotly_white",
                         height=380,
                     )
-                    st.plotly_chart(trail_fig, use_container_width=True)
+                    st.plotly_chart(trail_fig, width="stretch", key=f"trail_fig_{name}")
 
                     # HEATMAP
                     st.subheader("🔥 Heatmap")
@@ -790,7 +790,7 @@ def main():
                         for loc in coord_map
                     ])
                     if not heat_df.empty:
-                        heat_fig = px.density_mapbox(
+                        heat_fig = px.density_map(
                             heat_df,
                             lat="y",
                             lon="x",
@@ -798,11 +798,11 @@ def main():
                             radius=18,
                             center=dict(lat=heat_df["y"].mean(), lon=heat_df["x"].mean()),
                             zoom=14,
-                            mapbox_style="open-street-map",
+                            map_style="open-street-map",
                             height=420,
                         )
                         heat_fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
-                        st.plotly_chart(heat_fig, use_container_width=True)
+                        st.plotly_chart(heat_fig, width="stretch", key=f"heat_fig_{name}")
 
                     # PLOTLY-ANIMASJON
                     st.subheader("🎬 Interaktiv animasjon (Plotly)")
@@ -821,7 +821,7 @@ def main():
                         result["layout_df"],
                         trail_length=trail_length,
                     )
-                    st.plotly_chart(fig_plotly, use_container_width=True)
+                    st.plotly_chart(fig_plotly, width="stretch", key=f"animation_fig_{name}")
     
             ###############################################################
             # SAMMENLIGNING
@@ -1003,7 +1003,7 @@ def main():
                     showlegend=False,
                 )
             )
-            st.plotly_chart(fig_layout_opt, use_container_width=True)
+            st.plotly_chart(fig_layout_opt, width="stretch", key="fig_layout_opt")
     
     elif page == "🎨 Visuell demo":
         st.title("🎨 Visuell SimPy-simulering")
@@ -1067,7 +1067,7 @@ def main():
                 demo_result["layout_df"],
                 trail_length=trail_length_demo,
             )
-            st.plotly_chart(fig_demo, use_container_width=True)
+            st.plotly_chart(fig_demo, width="stretch", key="fig_demo")
 
             st.caption(
                 "Plukkplasser tegnes som statiske reoler i bakgrunnen. Fargene på plukkerne "
