@@ -477,77 +477,6 @@ def build_plotly_animation(mv_plot, x_range, y_range, layout_df=None, trail_leng
         for idx, pid in enumerate(sorted(mv_plot["picker"].unique()))
     }
 
-
-    # Plukkplasser som firkanter
-    for _, row in layout_df.iterrows():
-        rect = plt.Rectangle(
-            (row["x"] - 0.6, row["y"] - 0.6), 1.2, 1.2,
-            facecolor="#d6e9ff", edgecolor="#2a6fdb", linewidth=1.5, alpha=0.9
-        )
-        ax.add_patch(rect)
-        ax.text(row["x"], row["y"], f"{int(row['lokasjon'])}\n{row['artikkel']}",
-                ha="center", va="center", fontsize=8, color="#0a2f73")
-
-    # Plukkerposisjoner over tid
-    positions = {}
-    trails = {}
-    for pid in mv["picker"].unique():
-        subset = mv[mv["picker"] == pid]
-        current = subset[subset["time"] <= t_sel]
-        if not current.empty:
-            positions[pid] = current.iloc[-1][["x", "y"]].values
-            trails[pid] = current
-        else:
-            positions[pid] = np.array([0.0, 0.0])
-            trails[pid] = subset.head(1)
-
-    colors = px.colors.qualitative.Safe
-    for idx, (pid, pos) in enumerate(positions.items()):
-        raw_color = colors[idx % len(colors)]
-        if raw_color.startswith("rgb("):
-            rgb_parts = [int(c.strip()) / 255 for c in raw_color[4:-1].split(",")]
-            col = mcolors.to_hex(rgb_parts)
-        else:
-            col = mcolors.to_hex(raw_color)
-        trail = trails.get(pid)
-        if trail is not None and len(trail) > 1:
-            ax.plot(trail["x"], trail["y"], color=col, linewidth=1.5, alpha=0.6)
-        ax.scatter(pos[0], pos[1], s=140, color=col, edgecolor="black", zorder=3)
-        ax.text(pos[0], pos[1] + 0.4, f"P{pid}", ha="center", fontsize=9,
-                fontweight="bold", color=col)
-
-    xs = [c[0] for c in coord_map.values()]
-    ys = [c[1] for c in coord_map.values()]
-    ax.set_xlim(min(xs) - 2, max(xs) + 2)
-    ax.set_ylim(min(ys) - 2, max(ys) + 2)
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_title("SimPy-basert plukkflyt")
-    ax.set_aspect("equal")
-    ax.grid(True, linestyle="--", alpha=0.3)
-    return fig
-
-
-def _derive_zones(layout_df):
-    """Return a Series with a simple zone label per radiale rad i layouten."""
-
-    if "zone" in layout_df.columns:
-        return layout_df["zone"]
-
-    unique_rows = sorted(layout_df["y"].unique())
-    zone_names = {y: f"Sone {idx + 1}" for idx, y in enumerate(unique_rows)}
-    return layout_df["y"].map(zone_names)
-
-
-def build_plotly_animation(mv_plot, x_range, y_range, layout_df=None):
-    mv_plot = mv_plot.copy()
-    mv_plot["tid (min)"] = mv_plot["time"].round(2)
-    mv_plot["marker_size"] = np.where(mv_plot["event"] == "pick", 16, 10)
-    mv_plot["ikon"] = mv_plot["picker"].apply(lambda p: f"🧍 P{p}")
-    mv_plot.sort_values("time", inplace=True)
-
-    palette = px.colors.qualitative.Set3
-
     fig = px.scatter(
         mv_plot,
         x="x",
@@ -633,18 +562,6 @@ def build_plotly_animation(mv_plot, x_range, y_range, layout_df=None):
         initial_time = parse_frame_time(fig.frames[0].name)
         initial_trails = _trail_segments(mv_plot, initial_time, trail_length, picker_colors)
         fig.add_traces(initial_trails)
-
-        fig.add_trace(
-            go.Scatter(
-                x=layout_with_zones["x"],
-                y=layout_with_zones["y"],
-                mode="text",
-                text=[f"{int(row['lokasjon'])}<br>{row['zone']}" for _, row in layout_with_zones.iterrows()],
-                textfont=dict(color="#0a2f73", size=10),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
 
     return fig
 
@@ -780,12 +697,11 @@ def main():
                         key=f"trail_length_{name}",
                     )
                     fig_plotly = build_plotly_animation(
-                        mv, x_range, y_range, result["layout_df"], trail_length=trail_length
-    
-                    # PLOTLY-ANIMASJON
-                    st.subheader("🎬 Interaktiv animasjon (Plotly)")
-                    fig_plotly = build_plotly_animation(
-                        mv, x_range, y_range, result["layout_df"]
+                        mv,
+                        x_range,
+                        y_range,
+                        result["layout_df"],
+                        trail_length=trail_length,
                     )
                     st.plotly_chart(fig_plotly, use_container_width=True)
     
