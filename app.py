@@ -3,10 +3,14 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 # === IMPORTER MODULENE I DET NYE SYSTEMET === #
-from sim.simulation import (
-    run_simulation,
+from sim.simulation import run_simulation
+from sim.utils import (
+    generate_demo_layout,
+    generate_demo_orders,
     generate_picker_profiles,
 )
 from sim.visualization import (
@@ -18,6 +22,27 @@ from sim.optimization import (
     greedy_assignment,
     assignment_to_layout
 )
+
+
+def run_uploaded_scenarios(uploads, num_pickers, progress=None):
+    profiles = generate_picker_profiles(num_pickers)
+    scenarios = {}
+
+    for idx, uploaded in enumerate(uploads, start=1):
+        if uploaded is None:
+            raise ValueError(f"Layout {idx} mangler!")
+
+        if progress:
+            progress(idx)
+
+        uploaded.seek(0)
+        df_loc = pd.read_excel(uploaded, sheet_name="lokasjoner")
+        uploaded.seek(0)
+        df_orders = pd.read_excel(uploaded, sheet_name="ordrer")
+
+        scenarios[f"Layout {idx}"] = run_simulation(df_loc, df_orders, profiles)
+
+    return scenarios
 
 
 # ==========================================================
@@ -69,22 +94,15 @@ def page_simulation():
         uploads.append(up)
 
     if st.button("🚀 Kjør simulering"):
-        scenarios = {}
-
-        profiles = generate_picker_profiles(num_pickers)
-
-        for i in range(num_layouts):
-            if uploads[i] is None:
-                st.error(f"Layout {i+1} mangler!")
-                st.stop()
-
-            df_loc = pd.read_excel(uploads[i], sheet_name="lokasjoner")
-            df_orders = pd.read_excel(uploads[i], sheet_name="ordrer")
-
-            st.write(f"⏳ Kjør layout {i+1} …")
-
-            result = run_simulation(df_loc, df_orders, profiles)
-            scenarios[f"Layout {i+1}"] = result
+        try:
+            scenarios = run_uploaded_scenarios(
+                uploads,
+                num_pickers,
+                progress=lambda idx: st.write(f"⏳ Kjør layout {idx} …"),
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
 
         st.session_state["sim_scenarios"] = scenarios
         st.success("Kjøring ferdig! Scroll ned.")
@@ -117,7 +135,11 @@ def page_simulation():
             # --- layout tegning ---
             st.subheader("🏗️ Lagerlayout")
             fig_layout = build_static_layout(layout_df)
-            st.plotly_chart(fig_layout, use_container_width=True)
+            st.plotly_chart(
+                fig_layout,
+                use_container_width=True,
+                key=f"layout_chart_{name}",
+            )
 
             # --- trail / path plot ---
             st.subheader("📍 Plukkernes spor")
@@ -133,7 +155,11 @@ def page_simulation():
             # --- Heatmap ---
             st.subheader("🔥 Heatmap (automatisk row-wrapping)")
             fig_heat = build_heatmap(layout_df, heat)
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(
+                fig_heat,
+                use_container_width=True,
+                key=f"heat_chart_{name}",
+            )
 
             # --- Animasjon ---
             st.subheader("🎬 Animasjon")
@@ -146,7 +172,11 @@ def page_simulation():
                 fps=fps,
                 trail_length=trail_len
             )
-            st.plotly_chart(fig_anim, use_container_width=True)
+            st.plotly_chart(
+                fig_anim,
+                use_container_width=True,
+                key=f"anim_chart_{name}",
+            )
 
     # ---------- SAMMENLIGNING ----------
     with tabs[-1]:
@@ -226,7 +256,11 @@ def page_optimization():
                   delta=f"{round(base['total_minutes'] - opt['total_minutes'], 2)} min")
 
         st.subheader("Optimal layout")
-        st.plotly_chart(build_static_layout(opt["layout_df"]), use_container_width=True)
+        st.plotly_chart(
+            build_static_layout(opt["layout_df"]),
+            use_container_width=True,
+            key="opt_layout_chart",
+        )
 
 
 # ==========================================================
@@ -238,8 +272,6 @@ def page_visual_demo():
     demo_pickers = st.slider("Plukkere", 1, 10, 4)
     demo_orders = st.slider("Ordrer", 1, 30, 10)
     demo_seed = st.number_input("Seed", 1, 9999, 42)
-
-    from sim.simulation import generate_demo_layout, generate_demo_orders
 
     if st.button("🚀 Kjør demo"):
         layout = generate_demo_layout(seed=demo_seed)
@@ -263,22 +295,93 @@ def page_visual_demo():
     st.metric("Distanse", f"{res['total_distance_m']:.1f} m")
 
     st.subheader("Layout")
-    st.plotly_chart(build_static_layout(layout_df), use_container_width=True)
+    st.plotly_chart(
+        build_static_layout(layout_df),
+        use_container_width=True,
+        key="demo_layout_chart",
+    )
 
     st.subheader("Heatmap")
-    st.plotly_chart(build_heatmap(layout_df, heat), use_container_width=True)
+    st.plotly_chart(
+        build_heatmap(layout_df, heat),
+        use_container_width=True,
+        key="demo_heat_chart",
+    )
 
     st.subheader("Animasjon")
     fps = st.slider("FPS", 5, 40, 15)
     trail = st.slider("Sporlengde", 5, 200, 30)
 
     fig_anim = build_animation(mv, layout_df, fps=fps, trail_length=trail)
-    st.plotly_chart(fig_anim, use_container_width=True)
+    st.plotly_chart(
+        fig_anim,
+        use_container_width=True,
+        key="demo_anim_chart",
+    )
+
+
+# ==========================================================
+#             BACKWARD-COMPATIBLE VIS HELPERS FOR TESTS
+# ==========================================================
+def draw_frame(result, time):
+    layout_df = result["layout_df"]
+    mv = result["movement_df"]
+
+    fig, ax = plt.subplots()
+
+    for _, row in layout_df.iterrows():
+        rect = mpatches.Rectangle(
+            (row["x"] - 0.6, row["y"] - 0.6),
+            1.2,
+            1.2,
+            edgecolor="#2a6fdb",
+            facecolor="#e6f0ff",
+        )
+        ax.add_patch(rect)
+
+    latest_positions = (
+        mv[mv["time"] <= time]
+        .sort_values("time")
+        .groupby("picker")
+        .tail(1)
+    )
+
+    if not latest_positions.empty:
+        ax.scatter(latest_positions["x"], latest_positions["y"], c="#2a6fdb")
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_aspect("equal")
+
+    x_min, x_max = layout_df["x"].min(), layout_df["x"].max()
+    y_min, y_max = layout_df["y"].min(), layout_df["y"].max()
+    ax.set_xlim(x_min - 1, x_max + 1)
+    ax.set_ylim(y_min - 1, y_max + 1)
+
+    return fig
+
+
+def build_plotly_animation(mv_df, x_range, y_range, layout_df, trail_length=25):
+    fig = build_animation(mv_df, layout_df, trail_length=trail_length)
+
+    fig.update_layout(
+        xaxis=dict(range=tuple(x_range), scaleanchor="y", scaleratio=1),
+        yaxis=dict(range=tuple(y_range)),
+    )
+
+    for trace in fig.data:
+        if trace.text is None:
+            continue
+        if isinstance(trace.text, (list, tuple)):
+            trace.text = [f"🧍 {t}" for t in trace.text]
+        else:
+            trace.text = f"🧍 {trace.text}"
+
+    return fig
 
 
 # ==========================================================
 #                      MAIN
 # ==========================================================
 if __name__ == "__main__":
-    if os.environ.get("STREAMLIT_SUPPRESS_UI") != "1":
-        main()
+    main()
