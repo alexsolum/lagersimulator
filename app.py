@@ -56,13 +56,16 @@ def travel_time(coord_map, a, b):
 ###############################################################
 # PICKER-PROSESS
 ###############################################################
-def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap):
+def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap, stats):
     current = None
     total = 0
     log.append(f"Picker {pid} startet {env.now:.2f} min")
 
     while True:
+        request_time = env.now
         item = yield store.get()
+        wait_time = env.now - request_time
+        stats[pid]["wait_minutes"] += wait_time
 
         if item is None or item["order_list"] is None:
             log.append(f"Picker {pid} STOP {env.now:.2f}")
@@ -78,9 +81,12 @@ def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap):
 
         for nxt in locs:
             t_travel = travel_time(coord_map, current, nxt)
+            dist = 0
 
             (x1, y1) = coord_map[current]
             (x2, y2) = coord_map[nxt]
+            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            stats[pid]["distance_m"] += dist
 
             steps = max(1, int(t_travel * 5))
             for i in range(steps):
@@ -141,11 +147,15 @@ def run_simulation(df_loc, df_orders, num_pickers):
     log = []
     mv_log = []
     heatmap = {}
+    stats = {}
 
     pickers = []
     for i in range(num_pickers):
         eff = max(1, np.random.normal(MEAN_PICK_EFF, STD_PICK_EFF))
         pick_time_min = BASE_PICK_MIN * (MEAN_PICK_EFF / eff)
+
+        pid = str(i+1)
+        stats[pid] = {"distance_m": 0.0, "wait_minutes": 0.0}
 
         pickers.append({
             "picker": i+1,
@@ -154,25 +164,34 @@ def run_simulation(df_loc, df_orders, num_pickers):
         })
 
         env.process(
-            picker(env, str(i+1), store, coord_map,
-                   pick_time_min, log, mv_log, heatmap)
+            picker(env, pid, store, coord_map,
+                   pick_time_min, log, mv_log, heatmap, stats)
         )
 
     env.process(order_manager(env, store, orders, num_pickers))
     env.run()
 
     total_minutes = env.now
+    total_distance_m = sum(s["distance_m"] for s in stats.values())
+    total_wait_minutes = sum(s["wait_minutes"] for s in stats.values())
 
     mv_df = pd.DataFrame(mv_log, columns=["time", "picker", "x", "y"])
     mv_df = mv_df.sort_values("time")
+
+    picker_df = pd.DataFrame(pickers)
+    picker_df["distance_m"] = picker_df["picker"].apply(lambda pid: stats[str(pid)]["distance_m"])
+    picker_df["queue_time_min"] = picker_df["picker"].apply(lambda pid: stats[str(pid)]["wait_minutes"])
 
     return {
         "total_minutes": total_minutes,
         "total_time_str": format_time(total_minutes * 60),
         "movement_df": mv_df,
         "heatmap": heatmap,
-        "pickers": pd.DataFrame(pickers),
-        "coord_map": coord_map
+        "pickers": picker_df,
+        "coord_map": coord_map,
+        "total_distance_m": total_distance_m,
+        "total_wait_minutes": total_wait_minutes,
+        "layout_df": df_loc.copy()
     }
 
 
@@ -222,6 +241,12 @@ if run:
             st.subheader("⏱ Total tid")
             st.write(result["total_time_str"])
 
+            st.subheader("📏 Total distanse")
+            st.write(f"{result['total_distance_m']:.1f} meter")
+
+            st.subheader("⏳ Tid i kø")
+            st.write(format_time(result["total_wait_minutes"] * 60))
+
             st.subheader("👷 Plukkere")
             st.table(result["pickers"])
 
@@ -231,6 +256,17 @@ if run:
             loc_df = pd.DataFrame(
                 [{"loc": k, "x": coord_map[k][0], "y": coord_map[k][1]} for k in coord_map]
             )
+
+            # LAYOUTTEGNING
+            st.subheader("🏗️ Lagerlayout")
+            fig_layout, ax_layout = plt.subplots(figsize=(10, 4))
+            ax_layout.scatter(result["layout_df"]["x"], result["layout_df"]["y"], c="lightblue", s=200)
+            for _, row in result["layout_df"].iterrows():
+                ax_layout.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
+            ax_layout.set_xlabel("X (m)")
+            ax_layout.set_ylabel("Y (m)")
+            ax_layout.set_title("Lagerposisjoner")
+            st.pyplot(fig_layout)
 
             # SPOR
             st.subheader("📍 Plukkernes spor")
@@ -290,10 +326,14 @@ if run:
         st.subheader("📏 Total distanse (beregner av alle movement-punkter)")
         dist_data = []
         for name, res in scenarios.items():
-            mv = res["movement_df"]
-            dist = 0
-            for _, r in mv.sort_values("time").iterrows():
-                pass  # enkel distanselogikk kan legges inn senere
-            dist_data.append({"Layout": name, "Distanse (m)": "kommer"})
+            dist_data.append({"Layout": name, "Distanse (m)": round(res["total_distance_m"], 1)})
 
         st.table(pd.DataFrame(dist_data))
+
+        # KØTID
+        st.subheader("⏳ Tid i kø per layout")
+        queue_df = pd.DataFrame([
+            {"Layout": name, "Køtid (min)": res["total_wait_minutes"]}
+            for name, res in scenarios.items()
+        ])
+        st.bar_chart(queue_df.set_index("Layout"))
