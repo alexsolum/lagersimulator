@@ -92,3 +92,42 @@ def test_build_plotly_animation_creates_frames():
             picker_texts.append(trace.text)
 
     assert any("🧍" in str(text) for text in picker_texts)
+
+
+def _extract_line_opacities(frame):
+    opacities = []
+    for trace in frame.data:
+        if not hasattr(trace, "mode") or trace.mode is None:
+            continue
+        if "lines" not in trace.mode:
+            continue
+        line = getattr(trace, "line", None)
+        color = None
+        if line is not None:
+            color = getattr(line, "color", None)
+        if isinstance(color, str) and color.startswith("rgba"):
+            try:
+                opacities.append(float(color.split(",")[-1].rstrip(")")))
+            except ValueError:
+                continue
+    return opacities
+
+
+def test_plotly_trails_added_and_fading():
+    layout_df, orders_df = demo_data()
+    profiles = generate_picker_profiles(1, seed=7)
+    result = run_simulation(layout_df, orders_df, profiles)
+
+    mv = result["movement_df"]
+    x_range = [layout_df["x"].min() - 1, layout_df["x"].max() + 1]
+    y_range = [layout_df["y"].min() - 1, layout_df["y"].max() + 1]
+
+    fig = build_plotly_animation(mv, x_range, y_range, layout_df, trail_length=3)
+
+    assert fig.frames
+    last_frame = fig.frames[-1]
+    opacities = _extract_line_opacities(last_frame)
+
+    assert opacities, "Expected trail line segments in the animation frames"
+    assert max(opacities) > min(opacities), "Trail opacity should fade over time"
+    assert len(opacities) <= 3
