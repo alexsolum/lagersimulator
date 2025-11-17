@@ -1,9 +1,12 @@
+import os
+
 import streamlit as st
 import simpy
 import pandas as pd
 import numpy as np
 import math
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 import plotly.express as px
 
 ###############################################################
@@ -312,324 +315,479 @@ def assignment_to_layout(assignment_df):
 
 
 ###############################################################
+# DEMO-DATA OG VISUALISERINGER
+###############################################################
+def generate_demo_layout(seed=0):
+    rng = np.random.default_rng(seed)
+    rows = []
+    loc_id = 1
+    aisle_spacing = 3.0
+    slot_spacing = 2.4
+    for aisle in range(4):
+        x = aisle * aisle_spacing
+        for slot in range(8):
+            y = slot * slot_spacing
+            article = f"A{rng.integers(1, 9)}"
+            rows.append({
+                "lokasjon": loc_id,
+                "x": x,
+                "y": y,
+                "artikkel": article,
+                "antall": rng.integers(1, 3)
+            })
+            loc_id += 1
+    return pd.DataFrame(rows)
+
+
+def generate_demo_orders(seed, n_orders):
+    rng = np.random.default_rng(seed)
+    orders = []
+    for oid in range(1, n_orders + 1):
+        order_size = rng.integers(2, 5)
+        for _ in range(order_size):
+            orders.append({
+                "ordre": f"ORD-{oid:03d}",
+                "artikkel": f"A{rng.integers(1, 9)}"
+            })
+    return pd.DataFrame(orders)
+
+
+def draw_frame(result, t_sel):
+    mv = result["movement_df"]
+    layout_df = result["layout_df"]
+    coord_map = result["coord_map"]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Plukkplasser som firkanter
+    for _, row in layout_df.iterrows():
+        rect = plt.Rectangle(
+            (row["x"] - 0.6, row["y"] - 0.6), 1.2, 1.2,
+            facecolor="#d6e9ff", edgecolor="#2a6fdb", linewidth=1.5, alpha=0.9
+        )
+        ax.add_patch(rect)
+        ax.text(row["x"], row["y"], f"{int(row['lokasjon'])}\n{row['artikkel']}",
+                ha="center", va="center", fontsize=8, color="#0a2f73")
+
+    # Plukkerposisjoner over tid
+    positions = {}
+    trails = {}
+    for pid in mv["picker"].unique():
+        subset = mv[mv["picker"] == pid]
+        current = subset[subset["time"] <= t_sel]
+        if not current.empty:
+            positions[pid] = current.iloc[-1][["x", "y"]].values
+            trails[pid] = current
+        else:
+            positions[pid] = np.array([0.0, 0.0])
+            trails[pid] = subset.head(1)
+
+    colors = px.colors.qualitative.Safe
+    for idx, (pid, pos) in enumerate(positions.items()):
+        raw_color = colors[idx % len(colors)]
+        if raw_color.startswith("rgb("):
+            rgb_parts = [int(c.strip()) / 255 for c in raw_color[4:-1].split(",")]
+            col = mcolors.to_hex(rgb_parts)
+        else:
+            col = mcolors.to_hex(raw_color)
+        trail = trails.get(pid)
+        if trail is not None and len(trail) > 1:
+            ax.plot(trail["x"], trail["y"], color=col, linewidth=1.5, alpha=0.6)
+        ax.scatter(pos[0], pos[1], s=140, color=col, edgecolor="black", zorder=3)
+        ax.text(pos[0], pos[1] + 0.4, f"P{pid}", ha="center", fontsize=9,
+                fontweight="bold", color=col)
+
+    xs = [c[0] for c in coord_map.values()]
+    ys = [c[1] for c in coord_map.values()]
+    ax.set_xlim(min(xs) - 2, max(xs) + 2)
+    ax.set_ylim(min(ys) - 2, max(ys) + 2)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_title("SimPy-basert plukkflyt")
+    ax.set_aspect("equal")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    return fig
+
+
+def build_plotly_animation(mv_plot, x_range, y_range):
+    mv_plot = mv_plot.copy()
+    mv_plot["tid (min)"] = mv_plot["time"].round(2)
+    mv_plot["marker_size"] = np.where(mv_plot["event"] == "pick", 16, 10)
+    mv_plot.sort_values("time", inplace=True)
+
+    return px.scatter(
+        mv_plot,
+        x="x",
+        y="y",
+        color="picker",
+        symbol="event",
+        symbol_map={"move": "circle", "pick": "star"},
+        animation_frame="tid (min)",
+        animation_group="picker",
+        size="marker_size",
+        size_max=18,
+        range_x=x_range,
+        range_y=y_range,
+        labels={"x": "X (m)", "y": "Y (m)", "picker": "Plukker"},
+        title="Plukkerbevegelser over tid"
+    )
+
+
+###############################################################
 # UI – SIDEBAR NAVIGASJON
 ###############################################################
-page = st.sidebar.radio(
-    "Navigasjon",
-    ["📊 Simulering", "🧭 Lokasjonsoptimalisering"],
-    key="page_selector"
-)
-
-if page == "📊 Simulering":
-    st.title("📦 Multi-layout Lager-Simulering")
-
-    num_pickers = st.number_input(
-        "Hvor mange plukkere skal simuleringen bruke?", 1, 50, 5
+def main():
+    page = st.sidebar.radio(
+        "Navigasjon",
+        ["📊 Simulering", "🧭 Lokasjonsoptimalisering", "🎨 Visuell demo"],
+        key="page_selector"
     )
-    num_layouts = st.number_input("Hvor mange layouter vil du sammenligne?", 1, 5, 2)
-    uploaded = {}
-
-    if "scenarios" not in st.session_state:
-        st.session_state["scenarios"] = None
-
-    for i in range(num_layouts):
-        uploaded[i] = st.file_uploader(f"Last opp Layout {i+1}", type=["xlsx"], key=f"layout{i}")
-
-    run = st.button("🚀 Kjør simulering for alle layouts")
-
-    if run:
-        base_picker_profiles = generate_picker_profiles(num_pickers)
-        scenarios = {}
+    
+    if page == "📊 Simulering":
+        st.title("📦 Multi-layout Lager-Simulering")
+    
+        num_pickers = st.number_input(
+            "Hvor mange plukkere skal simuleringen bruke?", 1, 50, 5
+        )
+        num_layouts = st.number_input("Hvor mange layouter vil du sammenligne?", 1, 5, 2)
+        uploaded = {}
+    
+        if "scenarios" not in st.session_state:
+            st.session_state["scenarios"] = None
+    
         for i in range(num_layouts):
-            if uploaded[i] is None:
-                st.error(f"Mangler layout {i+1}")
-                st.stop()
-
-            df_loc = pd.read_excel(uploaded[i], sheet_name="lokasjoner")
-            df_orders = pd.read_excel(uploaded[i], sheet_name="ordrer")
-
-            st.write(f"⏳ Kjører layout {i+1}…")
-            scenarios[f"Layout {i+1}"] = run_simulation(
-                df_loc, df_orders, base_picker_profiles
-            )
-
-        st.session_state["scenarios"] = scenarios
-
-        st.success("Alle layout-simuleringer fullført! Scroll ned for resultater.")
-
-    scenarios = st.session_state.get("scenarios")
-
-    if scenarios:
-        ###############################################################
-        # TABS FOR VISUALISERING
-        ###############################################################
-        layout_tabs = st.tabs(list(scenarios.keys()) + ["📊 Sammenligning"])
-
-        ###############################################################
-        # VISUALISERING PER LAYOUT
-        ###############################################################
-        for tab, (name, result) in zip(layout_tabs, scenarios.items()):
-            with tab:
-                st.header(name)
-
-                st.subheader("⏱ Total tid")
-                st.write(result["total_time_str"])
-
-                st.subheader("📏 Total distanse")
-                st.write(f"{result['total_distance_m']:.1f} meter")
-
-                st.subheader("⏳ Tid i kø")
-                st.write(format_time(result["total_wait_minutes"] * 60))
-
-                st.subheader("👷 Plukkere")
-                st.table(result["pickers"])
-
-                mv = result["movement_df"]
-                coord_map = result["coord_map"]
-
-                loc_df = pd.DataFrame(
-                    [{"loc": k, "x": coord_map[k][0], "y": coord_map[k][1]} for k in coord_map]
+            uploaded[i] = st.file_uploader(f"Last opp Layout {i+1}", type=["xlsx"], key=f"layout{i}")
+    
+        run = st.button("🚀 Kjør simulering for alle layouts")
+    
+        if run:
+            base_picker_profiles = generate_picker_profiles(num_pickers)
+            scenarios = {}
+            for i in range(num_layouts):
+                if uploaded[i] is None:
+                    st.error(f"Mangler layout {i+1}")
+                    st.stop()
+    
+                df_loc = pd.read_excel(uploaded[i], sheet_name="lokasjoner")
+                df_orders = pd.read_excel(uploaded[i], sheet_name="ordrer")
+    
+                st.write(f"⏳ Kjører layout {i+1}…")
+                scenarios[f"Layout {i+1}"] = run_simulation(
+                    df_loc, df_orders, base_picker_profiles
                 )
-
-                x_padding = 1
-                y_padding = 1
-                x_range = [loc_df["x"].min() - x_padding, loc_df["x"].max() + x_padding]
-                y_range = [loc_df["y"].min() - y_padding, loc_df["y"].max() + y_padding]
-
-                # LAYOUTTEGNING
-                st.subheader("🏗️ Lagerlayout")
-                fig_layout, ax_layout = plt.subplots(figsize=(10, 4))
-                ax_layout.scatter(result["layout_df"]["x"], result["layout_df"]["y"], c="lightblue", s=200)
-                for _, row in result["layout_df"].iterrows():
-                    ax_layout.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
-                ax_layout.set_xlabel("X (m)")
-                ax_layout.set_ylabel("Y (m)")
-                ax_layout.set_title("Lagerposisjoner")
-                st.pyplot(fig_layout)
-
-                # SPOR
-                st.subheader("📍 Plukkernes spor")
-                fig, ax = plt.subplots(figsize=(10, 4))
-                ax.scatter(loc_df["x"], loc_df["y"], c="gray", s=50)
-                for pid in mv["picker"].unique():
-                    p = mv[mv["picker"] == pid]
-                    ax.plot(p["x"], p["y"], label=f"Picker {pid}")
-                ax.legend()
-                st.pyplot(fig)
-
-                # HEATMAP
-                st.subheader("🔥 Heatmap")
-                heat_df = pd.DataFrame([
-                    {"loc": loc, "visits": result["heatmap"].get(loc, 0),
-                     "x": coord_map[loc][0], "y": coord_map[loc][1]}
-                    for loc in coord_map
+    
+            st.session_state["scenarios"] = scenarios
+    
+            st.success("Alle layout-simuleringer fullført! Scroll ned for resultater.")
+    
+        scenarios = st.session_state.get("scenarios")
+    
+        if scenarios:
+            ###############################################################
+            # TABS FOR VISUALISERING
+            ###############################################################
+            layout_tabs = st.tabs(list(scenarios.keys()) + ["📊 Sammenligning"])
+    
+            ###############################################################
+            # VISUALISERING PER LAYOUT
+            ###############################################################
+            for tab, (name, result) in zip(layout_tabs, scenarios.items()):
+                with tab:
+                    st.header(name)
+    
+                    st.subheader("⏱ Total tid")
+                    st.write(result["total_time_str"])
+    
+                    st.subheader("📏 Total distanse")
+                    st.write(f"{result['total_distance_m']:.1f} meter")
+    
+                    st.subheader("⏳ Tid i kø")
+                    st.write(format_time(result["total_wait_minutes"] * 60))
+    
+                    st.subheader("👷 Plukkere")
+                    st.table(result["pickers"])
+    
+                    mv = result["movement_df"]
+                    coord_map = result["coord_map"]
+    
+                    loc_df = pd.DataFrame(
+                        [{"loc": k, "x": coord_map[k][0], "y": coord_map[k][1]} for k in coord_map]
+                    )
+    
+                    x_padding = 1
+                    y_padding = 1
+                    x_range = [loc_df["x"].min() - x_padding, loc_df["x"].max() + x_padding]
+                    y_range = [loc_df["y"].min() - y_padding, loc_df["y"].max() + y_padding]
+    
+                    # LAYOUTTEGNING
+                    st.subheader("🏗️ Lagerlayout")
+                    fig_layout, ax_layout = plt.subplots(figsize=(10, 4))
+                    ax_layout.scatter(result["layout_df"]["x"], result["layout_df"]["y"], c="lightblue", s=200)
+                    for _, row in result["layout_df"].iterrows():
+                        ax_layout.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
+                    ax_layout.set_xlabel("X (m)")
+                    ax_layout.set_ylabel("Y (m)")
+                    ax_layout.set_title("Lagerposisjoner")
+                    st.pyplot(fig_layout)
+    
+                    # SPOR
+                    st.subheader("📍 Plukkernes spor")
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    ax.scatter(loc_df["x"], loc_df["y"], c="gray", s=50)
+                    for pid in mv["picker"].unique():
+                        p = mv[mv["picker"] == pid]
+                        ax.plot(p["x"], p["y"], label=f"Picker {pid}")
+                    ax.legend()
+                    st.pyplot(fig)
+    
+                    # HEATMAP
+                    st.subheader("🔥 Heatmap")
+                    heat_df = pd.DataFrame([
+                        {"loc": loc, "visits": result["heatmap"].get(loc, 0),
+                         "x": coord_map[loc][0], "y": coord_map[loc][1]}
+                        for loc in coord_map
+                    ])
+                    fig2, ax2 = plt.subplots(figsize=(10, 4))
+                    sc = ax2.scatter(heat_df["x"], heat_df["y"],
+                                     c=heat_df["visits"], cmap="hot", s=200)
+                    plt.colorbar(sc, ax=ax2)
+                    st.pyplot(fig2)
+    
+                    # PLOTLY-ANIMASJON
+                    st.subheader("🎬 Interaktiv animasjon (Plotly)")
+                    fig_plotly = build_plotly_animation(mv, x_range, y_range)
+                    st.plotly_chart(fig_plotly, use_container_width=True)
+    
+                    # ANIMASJON (MATPLOTLIB-SLIDER)
+                    st.subheader("🎥 Animasjon med tids-slider")
+                    max_t = mv["time"].max()
+                    t_sel = st.slider(f"Tidspunkt – {name}", 0.0, float(max_t),
+                                      0.0, step=max(0.01, max_t/200), key=f"slider_{name}")
+                    st.write(f"⏱ {format_time(t_sel * 60)}")
+    
+                    frame = mv[mv["time"] <= t_sel]
+                    fig3, ax3 = plt.subplots(figsize=(10, 4))
+                    ax3.scatter(loc_df["x"], loc_df["y"], c="gray", s=50)
+                    for pid in frame["picker"].unique():
+                        p = frame[frame["picker"] == pid]
+                        ax3.plot(p["x"], p["y"], label=f"Picker {pid}")
+                        ax3.scatter(p["x"].iloc[-1], p["y"].iloc[-1], s=120)
+                    ax3.legend()
+                    st.pyplot(fig3)
+    
+            ###############################################################
+            # SAMMENLIGNING
+            ###############################################################
+            with layout_tabs[-1]:
+                st.header("📊 Sammenligning av layouts")
+    
+                # TOTALTID
+                st.subheader("⏱ Total tid per layout")
+                df_time = pd.DataFrame([
+                    {"Layout": name, "Total minutter": res["total_minutes"]}
+                    for name, res in scenarios.items()
                 ])
-                fig2, ax2 = plt.subplots(figsize=(10, 4))
-                sc = ax2.scatter(heat_df["x"], heat_df["y"],
-                                 c=heat_df["visits"], cmap="hot", s=200)
-                plt.colorbar(sc, ax=ax2)
-                st.pyplot(fig2)
-
-                # PLOTLY-ANIMASJON
-                st.subheader("🎬 Interaktiv animasjon (Plotly)")
-                mv_plot = mv.copy()
-                mv_plot["tid (min)"] = mv_plot["time"].round(2)
-                mv_plot["marker_size"] = np.where(mv_plot["event"] == "pick", 16, 10)
-                mv_plot.sort_values("time", inplace=True)
-                fig_plotly = px.scatter(
-                    mv_plot,
-                    x="x",
-                    y="y",
-                    color="picker",
-                    symbol="event",
-                    symbol_map={"move": "circle", "pick": "star"},
-                    animation_frame="tid (min)",
-                    animation_group="picker",
-                    size="marker_size",
-                    size_max=18,
-                    range_x=x_range,
-                    range_y=y_range,
-                    labels={"x": "X (m)", "y": "Y (m)", "picker": "Plukker"},
-                    title="Plukkerbevegelser over tid"
-                )
-                st.plotly_chart(fig_plotly, use_container_width=True)
-
-                # ANIMASJON (MATPLOTLIB-SLIDER)
-                st.subheader("🎥 Animasjon med tids-slider")
-                max_t = mv["time"].max()
-                t_sel = st.slider(f"Tidspunkt – {name}", 0.0, float(max_t),
-                                  0.0, step=max(0.01, max_t/200), key=f"slider_{name}")
-                st.write(f"⏱ {format_time(t_sel * 60)}")
-
-                frame = mv[mv["time"] <= t_sel]
-                fig3, ax3 = plt.subplots(figsize=(10, 4))
-                ax3.scatter(loc_df["x"], loc_df["y"], c="gray", s=50)
-                for pid in frame["picker"].unique():
-                    p = frame[frame["picker"] == pid]
-                    ax3.plot(p["x"], p["y"], label=f"Picker {pid}")
-                    ax3.scatter(p["x"].iloc[-1], p["y"].iloc[-1], s=120)
-                ax3.legend()
-                st.pyplot(fig3)
-
-        ###############################################################
-        # SAMMENLIGNING
-        ###############################################################
-        with layout_tabs[-1]:
-            st.header("📊 Sammenligning av layouts")
-
-            # TOTALTID
-            st.subheader("⏱ Total tid per layout")
-            df_time = pd.DataFrame([
-                {"Layout": name, "Total minutter": res["total_minutes"]}
-                for name, res in scenarios.items()
-            ])
-            st.bar_chart(df_time.set_index("Layout"))
-
-            # Distanse sammenligning
-            st.subheader("📏 Total distanse (beregner av alle movement-punkter)")
-            dist_data = []
-            for name, res in scenarios.items():
-                dist_data.append({"Layout": name, "Distanse (m)": round(res["total_distance_m"], 1)})
-
-            st.table(pd.DataFrame(dist_data))
-
-            # KØTID
-            st.subheader("⏳ Tid i kø per layout")
-            queue_df = pd.DataFrame([
-                {"Layout": name, "Køtid (min)": res["total_wait_minutes"]}
-                for name, res in scenarios.items()
-            ])
-            st.bar_chart(queue_df.set_index("Layout"))
-    else:
-        st.info("Last opp Excel-filer og trykk på \"Kjør simulering\" for å starte.")
-
-elif page == "🧭 Lokasjonsoptimalisering":
-    st.title("🧭 Assignment-basert lokasjonsoptimalisering")
-    st.markdown(
-        """
-        Last opp et oppsett med arkene `lokasjoner` og `ordrer`, så beregner vi en
-        greedy assignment der artikler med høyest etterspørsel får de nærmeste
-        ledige lokasjonene til valgt inngangspunkt. Resultatet kan lastes ned og
-        brukes som nytt grunnlag for simuleringene.
-        """
-    )
-
-    uploaded_opt = st.file_uploader("Last opp layoutfil", type=["xlsx"], key="opt_file")
-    col1, col2 = st.columns(2)
-    with col1:
-        entry_x = st.number_input("Inngang X-posisjon", value=0.0)
-    with col2:
-        entry_y = st.number_input("Inngang Y-posisjon", value=0.0)
-
-    sim_pickers = st.number_input(
-        "Antall plukkere for simulering av baseline vs optimal", 1, 50, 3
-    )
-
-    if st.button("🧮 Beregn forslag"):
-        if uploaded_opt is None:
-            st.error("Last opp en Excel-fil før du kjører optimeringen.")
-            st.stop()
-
-        df_loc = pd.read_excel(uploaded_opt, sheet_name="lokasjoner")
-        df_orders = pd.read_excel(uploaded_opt, sheet_name="ordrer")
-
-        if df_orders.empty or df_loc.empty:
-            st.error("Filen mangler data i arkene 'lokasjoner' og/eller 'ordrer'.")
-            st.stop()
-
-        demand = df_orders.groupby("artikkel").size()
-        assignment_df = greedy_assignment(df_loc, demand, entry_x, entry_y)
-
-        st.session_state["baseline_layout"] = df_loc
-        st.session_state["baseline_orders"] = df_orders
-        st.session_state["assignment_df"] = assignment_df
-
-        if assignment_df.empty:
-            st.warning("Ingen forslag generert – sjekk at lokasjoner og artikler er tilgjengelige.")
+                st.bar_chart(df_time.set_index("Layout"))
+    
+                # Distanse sammenligning
+                st.subheader("📏 Total distanse (beregner av alle movement-punkter)")
+                dist_data = []
+                for name, res in scenarios.items():
+                    dist_data.append({"Layout": name, "Distanse (m)": round(res["total_distance_m"], 1)})
+    
+                st.table(pd.DataFrame(dist_data))
+    
+                # KØTID
+                st.subheader("⏳ Tid i kø per layout")
+                queue_df = pd.DataFrame([
+                    {"Layout": name, "Køtid (min)": res["total_wait_minutes"]}
+                    for name, res in scenarios.items()
+                ])
+                st.bar_chart(queue_df.set_index("Layout"))
         else:
-            st.success("Ferdig! Tabellen under viser anbefalte plasseringer basert på etterspørsel.")
-            st.dataframe(assignment_df)
-
-            csv = assignment_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "💾 Last ned forslag (CSV)",
-                data=csv,
-                mime="text/csv",
-                file_name="lokasjonsforslag.csv"
+            st.info("Last opp Excel-filer og trykk på \"Kjør simulering\" for å starte.")
+    
+    elif page == "🧭 Lokasjonsoptimalisering":
+        st.title("🧭 Assignment-basert lokasjonsoptimalisering")
+        st.markdown(
+            """
+            Last opp et oppsett med arkene `lokasjoner` og `ordrer`, så beregner vi en
+            greedy assignment der artikler med høyest etterspørsel får de nærmeste
+            ledige lokasjonene til valgt inngangspunkt. Resultatet kan lastes ned og
+            brukes som nytt grunnlag for simuleringene.
+            """
+        )
+    
+        uploaded_opt = st.file_uploader("Last opp layoutfil", type=["xlsx"], key="opt_file")
+        col1, col2 = st.columns(2)
+        with col1:
+            entry_x = st.number_input("Inngang X-posisjon", value=0.0)
+        with col2:
+            entry_y = st.number_input("Inngang Y-posisjon", value=0.0)
+    
+        sim_pickers = st.number_input(
+            "Antall plukkere for simulering av baseline vs optimal", 1, 50, 3
+        )
+    
+        if st.button("🧮 Beregn forslag"):
+            if uploaded_opt is None:
+                st.error("Last opp en Excel-fil før du kjører optimeringen.")
+                st.stop()
+    
+            df_loc = pd.read_excel(uploaded_opt, sheet_name="lokasjoner")
+            df_orders = pd.read_excel(uploaded_opt, sheet_name="ordrer")
+    
+            if df_orders.empty or df_loc.empty:
+                st.error("Filen mangler data i arkene 'lokasjoner' og/eller 'ordrer'.")
+                st.stop()
+    
+            demand = df_orders.groupby("artikkel").size()
+            assignment_df = greedy_assignment(df_loc, demand, entry_x, entry_y)
+    
+            st.session_state["baseline_layout"] = df_loc
+            st.session_state["baseline_orders"] = df_orders
+            st.session_state["assignment_df"] = assignment_df
+    
+            if assignment_df.empty:
+                st.warning("Ingen forslag generert – sjekk at lokasjoner og artikler er tilgjengelige.")
+            else:
+                st.success("Ferdig! Tabellen under viser anbefalte plasseringer basert på etterspørsel.")
+                st.dataframe(assignment_df)
+    
+                csv = assignment_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "💾 Last ned forslag (CSV)",
+                    data=csv,
+                    mime="text/csv",
+                    file_name="lokasjonsforslag.csv"
+                )
+    
+        assignment_df = st.session_state.get("assignment_df")
+        base_layout = st.session_state.get("baseline_layout")
+        base_orders = st.session_state.get("baseline_orders")
+    
+        st.markdown("---")
+        st.subheader("🚀 Simuler og sammenlign med baseline")
+        st.markdown(
+            "Kjør en rask simulering av nåværende layout mot det foreslåtte oppsettet "
+            "for å se potensielle gevinster. Samme plukkerprofiler brukes for begge "
+            "kjøringer."
+        )
+    
+        if st.button("🎯 Simuler baseline og optimal layout"):
+            if assignment_df is None or base_layout is None or base_orders is None:
+                st.error("Kjør først optimeringen og generer et forslag før simulering.")
+                st.stop()
+    
+            picker_profiles = generate_picker_profiles(sim_pickers)
+    
+            optimized_layout = assignment_to_layout(assignment_df)
+    
+            baseline_result = run_simulation(base_layout, base_orders, picker_profiles)
+            optimal_result = run_simulation(optimized_layout, base_orders, picker_profiles)
+    
+            st.session_state["opt_compare"] = {
+                "baseline": baseline_result,
+                "optimal": optimal_result,
+            }
+    
+        compare = st.session_state.get("opt_compare")
+    
+        if compare:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("### 🏁 Baseline")
+                st.metric(
+                    "Total tid",
+                    compare["baseline"]["total_time_str"],
+                )
+                st.metric(
+                    "Total distanse (m)", f"{compare['baseline']['total_distance_m']:.1f}"
+                )
+                st.metric(
+                    "Tid i kø",
+                    format_time(compare["baseline"]["total_wait_minutes"] * 60)
+                )
+    
+            with col_b:
+                st.markdown("### 🆕 Optimalisert")
+                st.metric(
+                    "Total tid",
+                    compare["optimal"]["total_time_str"],
+                    delta=f"{compare['baseline']['total_minutes'] - compare['optimal']['total_minutes']:.2f} min"
+                )
+                st.metric(
+                    "Total distanse (m)",
+                    f"{compare['optimal']['total_distance_m']:.1f}",
+                    delta=f"{compare['baseline']['total_distance_m'] - compare['optimal']['total_distance_m']:.1f} m"
+                )
+                st.metric(
+                    "Tid i kø",
+                    format_time(compare["optimal"]["total_wait_minutes"] * 60),
+                    delta=f"{compare['baseline']['total_wait_minutes'] - compare['optimal']['total_wait_minutes']:.2f} min"
+                )
+    
+            st.markdown("### 📈 Visualisering av optimal layout")
+            optimal_layout_df = compare["optimal"]["layout_df"]
+            fig_layout_opt, ax_layout_opt = plt.subplots(figsize=(10, 4))
+            ax_layout_opt.scatter(optimal_layout_df["x"], optimal_layout_df["y"], c="lightgreen", s=200)
+            for _, row in optimal_layout_df.iterrows():
+                ax_layout_opt.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
+            ax_layout_opt.set_xlabel("X (m)")
+            ax_layout_opt.set_ylabel("Y (m)")
+            ax_layout_opt.set_title("Optimal layout fra assignment")
+            st.pyplot(fig_layout_opt)
+    
+    elif page == "🎨 Visuell demo":
+        st.title("🎨 Visuell SimPy-simulering")
+        st.markdown(
+            """
+            Denne siden kjører en forhåndsdefinert SimPy-simulering og viser en mer
+            realistisk visualisering av lageret. Plukkplasser tegnes som firkanter,
+            og plukkere vises som små runde figurer som beveger seg mellom lokasjonene.
+            """
+        )
+    
+        col_demo_a, col_demo_b = st.columns(2)
+        with col_demo_a:
+            demo_pickers = st.slider("Antall plukkere", 1, 10, 4)
+            demo_orders = st.slider("Antall ordrer", 1, 30, 10)
+        with col_demo_b:
+            demo_seed = st.number_input("Tilfeldig seed", value=42, step=1)
+            base_pick = st.number_input("Plukktid per vare (sek)", 5, 120, 12)
+    
+    
+        if st.button("🚀 Kjør demovisualisering"):
+            global BASE_PICK_SECONDS, BASE_PICK_MIN
+            BASE_PICK_SECONDS = base_pick
+            BASE_PICK_MIN = BASE_PICK_SECONDS / 60
+    
+            layout_df = generate_demo_layout(seed=demo_seed)
+            orders_df = generate_demo_orders(seed=demo_seed + 1, n_orders=demo_orders)
+            picker_profiles = generate_picker_profiles(demo_pickers, seed=demo_seed + 2)
+    
+            st.write("Simulerer ...")
+            demo_result = run_simulation(layout_df, orders_df, picker_profiles)
+            st.session_state["demo_result"] = demo_result
+            st.success("Demovisualisering klar! Bruk slideren under for å se bevegelser.")
+    
+        demo_result = st.session_state.get("demo_result")
+    
+        if demo_result:
+            st.markdown("---")
+            st.metric("Total simuleringstid", demo_result["total_time_str"])
+            st.metric("Total distanse (m)", f"{demo_result['total_distance_m']:.1f}")
+    
+            max_t = float(demo_result["movement_df"]["time"].max())
+            t_sel = st.slider("Tidspunkt i simuleringen (min)", 0.0, max_t, 0.0,
+                              step=max(0.05, max_t / 200), key="demo_time_slider")
+            fig_demo = draw_frame(demo_result, t_sel)
+            st.pyplot(fig_demo)
+    
+            st.caption(
+                "Plukkplasser (firkantene) viser lokasjons-ID og artikkel. Plukkerne "
+                "vises som fargede sirkler som beveger seg i SimPy-simuleringen."
             )
 
-    assignment_df = st.session_state.get("assignment_df")
-    base_layout = st.session_state.get("baseline_layout")
-    base_orders = st.session_state.get("baseline_orders")
-
-    st.markdown("---")
-    st.subheader("🚀 Simuler og sammenlign med baseline")
-    st.markdown(
-        "Kjør en rask simulering av nåværende layout mot det foreslåtte oppsettet "
-        "for å se potensielle gevinster. Samme plukkerprofiler brukes for begge "
-        "kjøringer."
-    )
-
-    if st.button("🎯 Simuler baseline og optimal layout"):
-        if assignment_df is None or base_layout is None or base_orders is None:
-            st.error("Kjør først optimeringen og generer et forslag før simulering.")
-            st.stop()
-
-        picker_profiles = generate_picker_profiles(sim_pickers)
-
-        optimized_layout = assignment_to_layout(assignment_df)
-
-        baseline_result = run_simulation(base_layout, base_orders, picker_profiles)
-        optimal_result = run_simulation(optimized_layout, base_orders, picker_profiles)
-
-        st.session_state["opt_compare"] = {
-            "baseline": baseline_result,
-            "optimal": optimal_result,
-        }
-
-    compare = st.session_state.get("opt_compare")
-
-    if compare:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("### 🏁 Baseline")
-            st.metric(
-                "Total tid",
-                compare["baseline"]["total_time_str"],
-            )
-            st.metric(
-                "Total distanse (m)", f"{compare['baseline']['total_distance_m']:.1f}"
-            )
-            st.metric(
-                "Tid i kø",
-                format_time(compare["baseline"]["total_wait_minutes"] * 60)
-            )
-
-        with col_b:
-            st.markdown("### 🆕 Optimalisert")
-            st.metric(
-                "Total tid",
-                compare["optimal"]["total_time_str"],
-                delta=f"{compare['baseline']['total_minutes'] - compare['optimal']['total_minutes']:.2f} min"
-            )
-            st.metric(
-                "Total distanse (m)",
-                f"{compare['optimal']['total_distance_m']:.1f}",
-                delta=f"{compare['baseline']['total_distance_m'] - compare['optimal']['total_distance_m']:.1f} m"
-            )
-            st.metric(
-                "Tid i kø",
-                format_time(compare["optimal"]["total_wait_minutes"] * 60),
-                delta=f"{compare['baseline']['total_wait_minutes'] - compare['optimal']['total_wait_minutes']:.2f} min"
-            )
-
-        st.markdown("### 📈 Visualisering av optimal layout")
-        optimal_layout_df = compare["optimal"]["layout_df"]
-        fig_layout_opt, ax_layout_opt = plt.subplots(figsize=(10, 4))
-        ax_layout_opt.scatter(optimal_layout_df["x"], optimal_layout_df["y"], c="lightgreen", s=200)
-        for _, row in optimal_layout_df.iterrows():
-            ax_layout_opt.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
-        ax_layout_opt.set_xlabel("X (m)")
-        ax_layout_opt.set_ylabel("Y (m)")
-        ax_layout_opt.set_title("Optimal layout fra assignment")
-        st.pyplot(fig_layout_opt)
+if os.environ.get("STREAMLIT_SUPPRESS_UI") != "1":
+    main()
