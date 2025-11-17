@@ -5,7 +5,6 @@ import simpy
 import pandas as pd
 import numpy as np
 import math
-import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 import plotly.express as px
 import plotly.graph_objects as go
@@ -92,6 +91,11 @@ def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap,
         wait_time = env.now - request_time
         stats[pid]["wait_minutes"] += wait_time
 
+        current_pos = coord_map.get(current, (0.0, 0.0)) if current is not None else (0.0, 0.0)
+        mv_log.append((request_time, pid, current_pos[0], current_pos[1], "queue"))
+        if wait_time > 0:
+            mv_log.append((env.now, pid, current_pos[0], current_pos[1], "queue"))
+
         if item is None or item["order_list"] is None:
             log.append(f"Picker {pid} STOP {env.now:.2f}")
             break
@@ -123,7 +127,12 @@ def picker(env, pid, store, coord_map, pick_time, log, mv_log, heatmap,
                 chosen = candidates[0]
                 req = location_resources[chosen].request()
 
+            queue_start = env.now
             yield req
+
+            if env.now > queue_start:
+                mv_log.append((queue_start, pid, current_pos[0], current_pos[1], "queue"))
+                mv_log.append((env.now, pid, current_pos[0], current_pos[1], "queue"))
 
             if location_stock.get(chosen, 0) <= 0:
                 location_resources[chosen].release(req)
@@ -353,63 +362,6 @@ def generate_demo_orders(seed, n_orders):
     return pd.DataFrame(orders)
 
 
-def draw_frame(result, t_sel):
-    mv = result["movement_df"]
-    layout_df = result["layout_df"]
-    coord_map = result["coord_map"]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    # Plukkplasser som firkanter
-    for _, row in layout_df.iterrows():
-        rect = plt.Rectangle(
-            (row["x"] - 0.6, row["y"] - 0.6), 1.2, 1.2,
-            facecolor="#d6e9ff", edgecolor="#2a6fdb", linewidth=1.5, alpha=0.9
-        )
-        ax.add_patch(rect)
-        ax.text(row["x"], row["y"], f"{int(row['lokasjon'])}\n{row['artikkel']}",
-                ha="center", va="center", fontsize=8, color="#0a2f73")
-
-    # Plukkerposisjoner over tid
-    positions = {}
-    trails = {}
-    for pid in mv["picker"].unique():
-        subset = mv[mv["picker"] == pid]
-        current = subset[subset["time"] <= t_sel]
-        if not current.empty:
-            positions[pid] = current.iloc[-1][["x", "y"]].values
-            trails[pid] = current
-        else:
-            positions[pid] = np.array([0.0, 0.0])
-            trails[pid] = subset.head(1)
-
-    colors = px.colors.qualitative.Safe
-    for idx, (pid, pos) in enumerate(positions.items()):
-        raw_color = colors[idx % len(colors)]
-        if raw_color.startswith("rgb("):
-            rgb_parts = [int(c.strip()) / 255 for c in raw_color[4:-1].split(",")]
-            col = mcolors.to_hex(rgb_parts)
-        else:
-            col = mcolors.to_hex(raw_color)
-        trail = trails.get(pid)
-        if trail is not None and len(trail) > 1:
-            ax.plot(trail["x"], trail["y"], color=col, linewidth=1.5, alpha=0.6)
-        ax.scatter(pos[0], pos[1], s=140, color=col, edgecolor="black", zorder=3)
-        ax.text(pos[0], pos[1] + 0.4, f"P{pid}", ha="center", fontsize=9,
-                fontweight="bold", color=col)
-
-    xs = [c[0] for c in coord_map.values()]
-    ys = [c[1] for c in coord_map.values()]
-    ax.set_xlim(min(xs) - 2, max(xs) + 2)
-    ax.set_ylim(min(ys) - 2, max(ys) + 2)
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_title("SimPy-basert plukkflyt")
-    ax.set_aspect("equal")
-    ax.grid(True, linestyle="--", alpha=0.3)
-    return fig
-
-
 def _derive_zones(layout_df):
     """Return a Series with a simple zone label per radiale rad i layouten."""
 
@@ -429,6 +381,113 @@ def _color_with_opacity(color, opacity):
         r, g, b = mcolors.to_rgb(color)
 
     return f"rgba({int(r * 255)},{int(g * 255)},{int(b * 255)},{opacity})"
+
+
+EVENT_COLORS = {
+    "pick": "#2ecc71",  # grønn
+    "move": "#3498db",  # blå
+    "queue": "#e74c3c",  # rød
+}
+
+
+def _build_static_shapes(layout_df):
+    shapes = []
+    if layout_df is None or layout_df.empty:
+        return shapes
+
+    for _, row in layout_df.iterrows():
+        shapes.append(
+            dict(
+                type="rect",
+                x0=row["x"] - 0.6,
+                x1=row["x"] + 0.6,
+                y0=row["y"] - 0.6,
+                y1=row["y"] + 0.6,
+                line=dict(color="#2a6fdb", width=1.2),
+                fillcolor="#d6e9ff",
+                layer="below",
+                opacity=0.8,
+            )
+        )
+    return shapes
+
+
+def _interpolate_movements(mv_df, fps=15):
+    if mv_df.empty:
+        return mv_df.copy()
+
+    mv_df = mv_df.sort_values("time")
+    t_min, t_max = mv_df["time"].min(), mv_df["time"].max()
+    if fps <= 0:
+        fps = 1
+    step = 1 / fps
+    timeline = np.arange(t_min, t_max + step, step)
+
+    rows = []
+    for pid in sorted(mv_df["picker"].unique()):
+        path = mv_df[mv_df["picker"] == pid].sort_values("time")
+        for t in timeline:
+            past = path[path["time"] <= t].tail(1)
+            future = path[path["time"] >= t].head(1)
+
+            if past.empty and future.empty:
+                continue
+            if past.empty:
+                past = future
+            if future.empty:
+                future = past
+
+            t0 = past.iloc[0]["time"]
+            t1 = future.iloc[0]["time"]
+            x0, y0 = past.iloc[0][["x", "y"]]
+            x1, y1 = future.iloc[0][["x", "y"]]
+
+            if t1 == t0:
+                frac = 0
+            else:
+                frac = (t - t0) / (t1 - t0)
+
+            x = x0 + (x1 - x0) * frac
+            y = y0 + (y1 - y0) * frac
+
+            event = past.iloc[0]["event"]
+            rows.append({"time": t, "picker": pid, "x": x, "y": y, "event": event})
+
+    interp = pd.DataFrame(rows)
+    interp.sort_values(["picker", "time"], inplace=True)
+    interp["vx"] = interp.groupby("picker")["x"].diff().fillna(0) / step
+    interp["vy"] = interp.groupby("picker")["y"].diff().fillna(0) / step
+    interp["color"] = interp["event"].map(EVENT_COLORS).fillna("#95a5a6")
+    return interp
+
+
+def _velocity_annotations(frame_points, picker_colors, scale=0.25):
+    annotations = []
+    for _, row in frame_points.iterrows():
+        speed = math.sqrt(row.get("vx", 0) ** 2 + row.get("vy", 0) ** 2)
+        if speed < 0.05:
+            continue
+        x0, y0 = row["x"], row["y"]
+        x1 = x0 + row.get("vx", 0) * scale
+        y1 = y0 + row.get("vy", 0) * scale
+        annotations.append(
+            dict(
+                x=x1,
+                y=y1,
+                ax=x0,
+                ay=y0,
+                xref="x",
+                yref="y",
+                axref="x",
+                ayref="y",
+                showarrow=True,
+                arrowhead=3,
+                arrowwidth=2,
+                arrowcolor=picker_colors.get(row["picker"], "#2c3e50"),
+                opacity=0.9,
+            )
+        )
+    return annotations
 
 
 def _trail_segments(mv_plot, frame_time, trail_length, color_map):
@@ -464,104 +523,125 @@ def _trail_segments(mv_plot, frame_time, trail_length, color_map):
     return traces
 
 
-def build_plotly_animation(mv_plot, x_range, y_range, layout_df=None, trail_length=12):
+def build_plotly_animation(mv_plot, x_range, y_range, layout_df=None, trail_length=24, fps=15):
     mv_plot = mv_plot.copy()
-    mv_plot["tid (min)"] = mv_plot["time"].round(2)
-    mv_plot["marker_size"] = np.where(mv_plot["event"] == "pick", 16, 10)
-    mv_plot["ikon"] = mv_plot["picker"].apply(lambda p: f"🧍 P{p}")
     mv_plot.sort_values("time", inplace=True)
+    mv_plot["event"] = mv_plot["event"].fillna("move")
+
+    interpolated = _interpolate_movements(mv_plot, fps=fps)
 
     palette = px.colors.qualitative.Set3
     picker_colors = {
         pid: palette[idx % len(palette)]
-        for idx, pid in enumerate(sorted(mv_plot["picker"].unique()))
+        for idx, pid in enumerate(sorted(interpolated["picker"].unique()))
     }
 
-    fig = px.scatter(
-        mv_plot,
-        x="x",
-        y="y",
-        color="picker",
-        symbol="event",
-        symbol_map={"move": "circle", "pick": "star"},
-        animation_frame="tid (min)",
-        animation_group="picker",
-        size="marker_size",
-        size_max=20,
-        range_x=x_range,
-        range_y=y_range,
-        labels={"x": "X (m)", "y": "Y (m)", "picker": "Plukker"},
-        title="Plukkerbevegelser over tid",
-        hover_name="ikon",
-    )
+    shapes = _build_static_shapes(layout_df)
+    frames = []
+    unique_times = sorted(interpolated["time"].unique())
 
-    fig.update_traces(
-        text=mv_plot["ikon"],
-        textposition="top center",
-        marker=dict(line=dict(color="black", width=1.2), symbol="circle"),
-        opacity=0.9,
-    )
+    for idx, t in enumerate(unique_times):
+        frame_points = interpolated[interpolated["time"] == t]
+        trail_traces = _trail_segments(interpolated, t, trail_length, picker_colors)
+        marker_outline = [picker_colors.get(p, "#2c3e50") for p in frame_points["picker"]]
+        texts = [f"P{p}" for p in frame_points["picker"]]
 
-    if layout_df is not None and not layout_df.empty:
-        layout_with_zones = layout_df.copy()
-        layout_with_zones["zone"] = _derive_zones(layout_with_zones)
-
-        zone_palette = {
-            zone: palette[i % len(palette)]
-            for i, zone in enumerate(sorted(layout_with_zones["zone"].unique()))
-        }
-
-        shapes = []
-        for _, row in layout_with_zones.iterrows():
-            color = zone_palette.get(row["zone"], "#d6e9ff")
-            shapes.append(
-                dict(
-                    type="rect",
-                    x0=row["x"] - 0.6,
-                    x1=row["x"] + 0.6,
-                    y0=row["y"] - 0.6,
-                    y1=row["y"] + 0.6,
-                    line=dict(color="rgba(20, 20, 20, 0.6)", width=1.6),
-                    fillcolor=color,
-                    opacity=0.35,
-                    layer="below",
-                )
-            )
-
-        fig.update_layout(
-            shapes=shapes,
-            legend_title_text="Plukker (ikon)",
-            plot_bgcolor="#f9f9f9",
-            yaxis_scaleanchor="x",
+        scatter = go.Scatter(
+            x=frame_points["x"],
+            y=frame_points["y"],
+            mode="markers+text",
+            marker=dict(
+                size=16,
+                color=frame_points["color"],
+                line=dict(color=marker_outline, width=2),
+            ),
+            text=texts,
+            textposition="top center",
+            hovertemplate=(
+                "<b>P%{customdata[0]}</b><br>" "Tid: %{customdata[1]:.2f} min<br>"
+                "Hendelse: %{customdata[2]}<extra></extra>"
+            ),
+            customdata=np.stack(
+                [frame_points["picker"], frame_points["time"], frame_points["event"]],
+                axis=-1,
+            ),
+            showlegend=False,
+            name=f"frame_{idx}",
         )
 
+        annotations = _velocity_annotations(frame_points, picker_colors)
+        frames.append(
+            go.Frame(
+                name=f"frame-{idx}",
+                data=trail_traces + [scatter],
+                layout=go.Layout(shapes=shapes, annotations=annotations),
+            )
+        )
+
+    start_data = frames[0].data if frames else []
+
+    fig = go.Figure(data=start_data, frames=frames)
+    fig.update_layout(
+        title="Plukkerbevegelser over tid (Plotly)",
+        xaxis=dict(range=x_range, title="X (m)"),
+        yaxis=dict(range=y_range, title="Y (m)", scaleanchor="x", scaleratio=1),
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=60, b=10),
+        shapes=shapes,
+        legend_title="Hendelser",
+    )
+
+    slider_steps = [
+        {
+            "args": [[f"frame-{idx}"], {"frame": {"duration": int(1000 / fps), "redraw": True}, "mode": "immediate"}],
+            "label": f"{t:.2f} min",
+            "method": "animate",
+        }
+        for idx, t in enumerate(unique_times)
+    ]
+
+    fig.update_layout(
+        updatemenus=[
+            {
+                "type": "buttons",
+                "showactive": False,
+                "buttons": [
+                    {
+                        "label": "▶️ Spille av",
+                        "method": "animate",
+                        "args": [None, {"frame": {"duration": int(1000 / fps), "redraw": True}, "fromcurrent": True}],
+                    },
+                    {
+                        "label": "⏸ Pause",
+                        "method": "animate",
+                        "args": [[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
+                    },
+                ],
+            }
+        ],
+        sliders=[
+            {
+                "steps": slider_steps,
+                "currentvalue": {"prefix": "Tid: "},
+                "x": 0,
+                "y": -0.05,
+                "len": 1.0,
+            }
+        ],
+    )
+
+    for event, color in EVENT_COLORS.items():
         fig.add_trace(
             go.Scatter(
-                x=layout_with_zones["x"],
-                y=layout_with_zones["y"],
-                mode="text",
-                text=[f"{int(row['lokasjon'])}<br>{row['zone']}" for _, row in layout_with_zones.iterrows()],
-                textfont=dict(color="#0a2f73", size=10),
-                showlegend=False,
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(color=color, size=12),
+                name=event.capitalize(),
+                showlegend=True,
                 hoverinfo="skip",
             )
         )
-
-    if fig.frames:
-        def parse_frame_time(frame_name):
-            try:
-                return float(frame_name)
-            except (TypeError, ValueError):
-                return float(mv_plot["time"].min())
-
-        for frame in fig.frames:
-            frame_time = parse_frame_time(frame.name)
-            trail_traces = _trail_segments(mv_plot, frame_time, trail_length, picker_colors)
-            frame.data = frame.data + tuple(trail_traces)
-
-        initial_time = parse_frame_time(fig.frames[0].name)
-        initial_trails = _trail_segments(mv_plot, initial_time, trail_length, picker_colors)
-        fig.add_traces(initial_trails)
 
     return fig
 
@@ -651,28 +731,57 @@ def main():
                     y_padding = 1
                     x_range = [loc_df["x"].min() - x_padding, loc_df["x"].max() + x_padding]
                     y_range = [loc_df["y"].min() - y_padding, loc_df["y"].max() + y_padding]
-    
+
                     # LAYOUTTEGNING
                     st.subheader("🏗️ Lagerlayout")
-                    fig_layout, ax_layout = plt.subplots(figsize=(10, 4))
-                    ax_layout.scatter(result["layout_df"]["x"], result["layout_df"]["y"], c="lightblue", s=200)
-                    for _, row in result["layout_df"].iterrows():
-                        ax_layout.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
-                    ax_layout.set_xlabel("X (m)")
-                    ax_layout.set_ylabel("Y (m)")
-                    ax_layout.set_title("Lagerposisjoner")
-                    st.pyplot(fig_layout)
-    
+                    layout_fig = go.Figure()
+                    layout_fig.update_layout(
+                        shapes=_build_static_shapes(result["layout_df"]),
+                        xaxis=dict(range=x_range, title="X (m)"),
+                        yaxis=dict(range=y_range, title="Y (m)", scaleanchor="x", scaleratio=1),
+                        title="Lagerposisjoner",
+                        template="plotly_white",
+                        height=420,
+                    )
+                    layout_fig.add_trace(
+                        go.Scatter(
+                            x=result["layout_df"]["x"],
+                            y=result["layout_df"]["y"],
+                            mode="markers+text",
+                            text=[f"{int(row['lokasjon'])}" for _, row in result["layout_df"].iterrows()],
+                            textposition="middle center",
+                            marker=dict(color="#2a6fdb", size=8),
+                            hovertemplate="Lokasjon %{text}<br>X=%{x:.2f}, Y=%{y:.2f}<extra></extra>",
+                            showlegend=False,
+                        )
+                    )
+                    st.plotly_chart(layout_fig, use_container_width=True)
+
                     # SPOR
                     st.subheader("📍 Plukkernes spor")
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    ax.scatter(loc_df["x"], loc_df["y"], c="gray", s=50)
-                    for pid in mv["picker"].unique():
-                        p = mv[mv["picker"] == pid]
-                        ax.plot(p["x"], p["y"], label=f"Picker {pid}")
-                    ax.legend()
-                    st.pyplot(fig)
-    
+                    trail_fig = go.Figure()
+                    palette = px.colors.qualitative.Set3
+                    for idx, pid in enumerate(sorted(mv["picker"].unique())):
+                        path = mv[mv["picker"] == pid]
+                        color = palette[idx % len(palette)]
+                        trail_fig.add_trace(
+                            go.Scatter(
+                                x=path["x"],
+                                y=path["y"],
+                                mode="lines+markers",
+                                name=f"Picker {pid}",
+                                line=dict(color=color, width=2),
+                                marker=dict(size=6, color=color),
+                            )
+                        )
+                    trail_fig.update_layout(
+                        xaxis=dict(range=x_range, title="X (m)"),
+                        yaxis=dict(range=y_range, title="Y (m)", scaleanchor="x", scaleratio=1),
+                        template="plotly_white",
+                        height=380,
+                    )
+                    st.plotly_chart(trail_fig, use_container_width=True)
+
                     # HEATMAP
                     st.subheader("🔥 Heatmap")
                     heat_df = pd.DataFrame([
@@ -680,11 +789,20 @@ def main():
                          "x": coord_map[loc][0], "y": coord_map[loc][1]}
                         for loc in coord_map
                     ])
-                    fig2, ax2 = plt.subplots(figsize=(10, 4))
-                    sc = ax2.scatter(heat_df["x"], heat_df["y"],
-                                     c=heat_df["visits"], cmap="hot", s=200)
-                    plt.colorbar(sc, ax=ax2)
-                    st.pyplot(fig2)
+                    if not heat_df.empty:
+                        heat_fig = px.density_mapbox(
+                            heat_df,
+                            lat="y",
+                            lon="x",
+                            z="visits",
+                            radius=18,
+                            center=dict(lat=heat_df["y"].mean(), lon=heat_df["x"].mean()),
+                            zoom=14,
+                            mapbox_style="open-street-map",
+                            height=420,
+                        )
+                        heat_fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
+                        st.plotly_chart(heat_fig, use_container_width=True)
 
                     # PLOTLY-ANIMASJON
                     st.subheader("🎬 Interaktiv animasjon (Plotly)")
@@ -704,23 +822,6 @@ def main():
                         trail_length=trail_length,
                     )
                     st.plotly_chart(fig_plotly, use_container_width=True)
-    
-                    # ANIMASJON (MATPLOTLIB-SLIDER)
-                    st.subheader("🎥 Animasjon med tids-slider")
-                    max_t = mv["time"].max()
-                    t_sel = st.slider(f"Tidspunkt – {name}", 0.0, float(max_t),
-                                      0.0, step=max(0.01, max_t/200), key=f"slider_{name}")
-                    st.write(f"⏱ {format_time(t_sel * 60)}")
-    
-                    frame = mv[mv["time"] <= t_sel]
-                    fig3, ax3 = plt.subplots(figsize=(10, 4))
-                    ax3.scatter(loc_df["x"], loc_df["y"], c="gray", s=50)
-                    for pid in frame["picker"].unique():
-                        p = frame[frame["picker"] == pid]
-                        ax3.plot(p["x"], p["y"], label=f"Picker {pid}")
-                        ax3.scatter(p["x"].iloc[-1], p["y"].iloc[-1], s=120)
-                    ax3.legend()
-                    st.pyplot(fig3)
     
             ###############################################################
             # SAMMENLIGNING
@@ -876,14 +977,33 @@ def main():
     
             st.markdown("### 📈 Visualisering av optimal layout")
             optimal_layout_df = compare["optimal"]["layout_df"]
-            fig_layout_opt, ax_layout_opt = plt.subplots(figsize=(10, 4))
-            ax_layout_opt.scatter(optimal_layout_df["x"], optimal_layout_df["y"], c="lightgreen", s=200)
-            for _, row in optimal_layout_df.iterrows():
-                ax_layout_opt.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
-            ax_layout_opt.set_xlabel("X (m)")
-            ax_layout_opt.set_ylabel("Y (m)")
-            ax_layout_opt.set_title("Optimal layout fra assignment")
-            st.pyplot(fig_layout_opt)
+            x_padding = 1
+            y_padding = 1
+            x_range = [optimal_layout_df["x"].min() - x_padding, optimal_layout_df["x"].max() + x_padding]
+            y_range = [optimal_layout_df["y"].min() - y_padding, optimal_layout_df["y"].max() + y_padding]
+
+            fig_layout_opt = go.Figure()
+            fig_layout_opt.update_layout(
+                shapes=_build_static_shapes(optimal_layout_df),
+                xaxis=dict(range=x_range, title="X (m)"),
+                yaxis=dict(range=y_range, title="Y (m)", scaleanchor="x", scaleratio=1),
+                template="plotly_white",
+                title="Optimal layout fra assignment",
+                height=420,
+            )
+            fig_layout_opt.add_trace(
+                go.Scatter(
+                    x=optimal_layout_df["x"],
+                    y=optimal_layout_df["y"],
+                    mode="markers+text",
+                    text=[f"{int(row['lokasjon'])}" for _, row in optimal_layout_df.iterrows()],
+                    textposition="middle center",
+                    marker=dict(color="#27ae60", size=9),
+                    hovertemplate="Lokasjon %{text}<br>X=%{x:.2f}, Y=%{y:.2f}<extra></extra>",
+                    showlegend=False,
+                )
+            )
+            st.plotly_chart(fig_layout_opt, use_container_width=True)
     
     elif page == "🎨 Visuell demo":
         st.title("🎨 Visuell SimPy-simulering")
@@ -924,16 +1044,35 @@ def main():
             st.markdown("---")
             st.metric("Total simuleringstid", demo_result["total_time_str"])
             st.metric("Total distanse (m)", f"{demo_result['total_distance_m']:.1f}")
-    
-            max_t = float(demo_result["movement_df"]["time"].max())
-            t_sel = st.slider("Tidspunkt i simuleringen (min)", 0.0, max_t, 0.0,
-                              step=max(0.05, max_t / 200), key="demo_time_slider")
-            fig_demo = draw_frame(demo_result, t_sel)
-            st.pyplot(fig_demo)
-    
+
+            mv_demo = demo_result["movement_df"]
+            coord_map = demo_result["coord_map"]
+            loc_df = pd.DataFrame(
+                [{"loc": k, "x": coord_map[k][0], "y": coord_map[k][1]} for k in coord_map]
+            )
+
+            x_padding = 1
+            y_padding = 1
+            x_range = [loc_df["x"].min() - x_padding, loc_df["x"].max() + x_padding]
+            y_range = [loc_df["y"].min() - y_padding, loc_df["y"].max() + y_padding]
+
+            trail_length_demo = st.slider(
+                "Sporlengde i demo", 1, 200, 30, step=1, key="demo_trail_length"
+            )
+
+            fig_demo = build_plotly_animation(
+                mv_demo,
+                x_range,
+                y_range,
+                demo_result["layout_df"],
+                trail_length=trail_length_demo,
+            )
+            st.plotly_chart(fig_demo, use_container_width=True)
+
             st.caption(
-                "Plukkplasser (firkantene) viser lokasjons-ID og artikkel. Plukkerne "
-                "vises som fargede sirkler som beveger seg i SimPy-simuleringen."
+                "Plukkplasser tegnes som statiske reoler i bakgrunnen. Fargene på plukkerne "
+                "viser hendelser (grønn=plukk, blå=bevegelse, rød=venting), og pilene viser "
+                "retningen til bevegelsen."
             )
 
 if os.environ.get("STREAMLIT_SUPPRESS_UI") != "1":
