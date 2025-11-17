@@ -3,10 +3,14 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 # === IMPORTER MODULENE I DET NYE SYSTEMET === #
-from sim.simulation import (
-    run_simulation,
+from sim.simulation import run_simulation
+from sim.utils import (
+    generate_demo_layout,
+    generate_demo_orders,
     generate_picker_profiles,
 )
 from sim.visualization import (
@@ -239,8 +243,6 @@ def page_visual_demo():
     demo_orders = st.slider("Ordrer", 1, 30, 10)
     demo_seed = st.number_input("Seed", 1, 9999, 42)
 
-    from sim.simulation import generate_demo_layout, generate_demo_orders
-
     if st.button("🚀 Kjør demo"):
         layout = generate_demo_layout(seed=demo_seed)
         orders = generate_demo_orders(demo_seed + 1, demo_orders)
@@ -274,6 +276,66 @@ def page_visual_demo():
 
     fig_anim = build_animation(mv, layout_df, fps=fps, trail_length=trail)
     st.plotly_chart(fig_anim, use_container_width=True)
+
+
+# ==========================================================
+#             BACKWARD-COMPATIBLE VIS HELPERS FOR TESTS
+# ==========================================================
+def draw_frame(result, time):
+    layout_df = result["layout_df"]
+    mv = result["movement_df"]
+
+    fig, ax = plt.subplots()
+
+    for _, row in layout_df.iterrows():
+        rect = mpatches.Rectangle(
+            (row["x"] - 0.6, row["y"] - 0.6),
+            1.2,
+            1.2,
+            edgecolor="#2a6fdb",
+            facecolor="#e6f0ff",
+        )
+        ax.add_patch(rect)
+
+    latest_positions = (
+        mv[mv["time"] <= time]
+        .sort_values("time")
+        .groupby("picker")
+        .tail(1)
+    )
+
+    if not latest_positions.empty:
+        ax.scatter(latest_positions["x"], latest_positions["y"], c="#2a6fdb")
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_aspect("equal")
+
+    x_min, x_max = layout_df["x"].min(), layout_df["x"].max()
+    y_min, y_max = layout_df["y"].min(), layout_df["y"].max()
+    ax.set_xlim(x_min - 1, x_max + 1)
+    ax.set_ylim(y_min - 1, y_max + 1)
+
+    return fig
+
+
+def build_plotly_animation(mv_df, x_range, y_range, layout_df, trail_length=25):
+    fig = build_animation(mv_df, layout_df, trail_length=trail_length)
+
+    fig.update_layout(
+        xaxis=dict(range=tuple(x_range), scaleanchor="y", scaleratio=1),
+        yaxis=dict(range=tuple(y_range)),
+    )
+
+    for trace in fig.data:
+        if trace.text is None:
+            continue
+        if isinstance(trace.text, (list, tuple)):
+            trace.text = [f"🧍 {t}" for t in trace.text]
+        else:
+            trace.text = f"🧍 {trace.text}"
+
+    return fig
 
 
 # ==========================================================
