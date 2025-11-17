@@ -181,6 +181,9 @@ def run_simulation(df_loc, df_orders, num_pickers):
 ###############################################################
 st.title("📦 Multi-layout Lager-Simulering")
 
+num_pickers = st.number_input(
+    "Hvor mange plukkere skal simuleringen bruke?", 1, 50, 5
+)
 num_layouts = st.number_input("Hvor mange layouter vil du sammenligne?", 1, 5, 2)
 uploaded = {}
 
