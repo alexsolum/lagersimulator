@@ -302,6 +302,15 @@ def greedy_assignment(df_loc, demand_series, entry_x=0.0, entry_y=0.0):
     return pd.DataFrame(assignments)
 
 
+def assignment_to_layout(assignment_df):
+    if assignment_df.empty:
+        return pd.DataFrame(columns=["lokasjon", "x", "y", "artikkel", "antall"])
+
+    layout = assignment_df.copy()
+    layout["antall"] = 1
+    return layout[["lokasjon", "x", "y", "artikkel", "antall"]]
+
+
 ###############################################################
 # UI – SIDEBAR NAVIGASJON
 ###############################################################
@@ -512,6 +521,10 @@ elif page == "🧭 Lokasjonsoptimalisering":
     with col2:
         entry_y = st.number_input("Inngang Y-posisjon", value=0.0)
 
+    sim_pickers = st.number_input(
+        "Antall plukkere for simulering av baseline vs optimal", 1, 50, 3
+    )
+
     if st.button("🧮 Beregn forslag"):
         if uploaded_opt is None:
             st.error("Last opp en Excel-fil før du kjører optimeringen.")
@@ -527,6 +540,10 @@ elif page == "🧭 Lokasjonsoptimalisering":
         demand = df_orders.groupby("artikkel").size()
         assignment_df = greedy_assignment(df_loc, demand, entry_x, entry_y)
 
+        st.session_state["baseline_layout"] = df_loc
+        st.session_state["baseline_orders"] = df_orders
+        st.session_state["assignment_df"] = assignment_df
+
         if assignment_df.empty:
             st.warning("Ingen forslag generert – sjekk at lokasjoner og artikler er tilgjengelige.")
         else:
@@ -540,3 +557,79 @@ elif page == "🧭 Lokasjonsoptimalisering":
                 mime="text/csv",
                 file_name="lokasjonsforslag.csv"
             )
+
+    assignment_df = st.session_state.get("assignment_df")
+    base_layout = st.session_state.get("baseline_layout")
+    base_orders = st.session_state.get("baseline_orders")
+
+    st.markdown("---")
+    st.subheader("🚀 Simuler og sammenlign med baseline")
+    st.markdown(
+        "Kjør en rask simulering av nåværende layout mot det foreslåtte oppsettet "
+        "for å se potensielle gevinster. Samme plukkerprofiler brukes for begge "
+        "kjøringer."
+    )
+
+    if st.button("🎯 Simuler baseline og optimal layout"):
+        if assignment_df is None or base_layout is None or base_orders is None:
+            st.error("Kjør først optimeringen og generer et forslag før simulering.")
+            st.stop()
+
+        picker_profiles = generate_picker_profiles(sim_pickers)
+
+        optimized_layout = assignment_to_layout(assignment_df)
+
+        baseline_result = run_simulation(base_layout, base_orders, picker_profiles)
+        optimal_result = run_simulation(optimized_layout, base_orders, picker_profiles)
+
+        st.session_state["opt_compare"] = {
+            "baseline": baseline_result,
+            "optimal": optimal_result,
+        }
+
+    compare = st.session_state.get("opt_compare")
+
+    if compare:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("### 🏁 Baseline")
+            st.metric(
+                "Total tid",
+                compare["baseline"]["total_time_str"],
+            )
+            st.metric(
+                "Total distanse (m)", f"{compare['baseline']['total_distance_m']:.1f}"
+            )
+            st.metric(
+                "Tid i kø",
+                format_time(compare["baseline"]["total_wait_minutes"] * 60)
+            )
+
+        with col_b:
+            st.markdown("### 🆕 Optimalisert")
+            st.metric(
+                "Total tid",
+                compare["optimal"]["total_time_str"],
+                delta=f"{compare['baseline']['total_minutes'] - compare['optimal']['total_minutes']:.2f} min"
+            )
+            st.metric(
+                "Total distanse (m)",
+                f"{compare['optimal']['total_distance_m']:.1f}",
+                delta=f"{compare['baseline']['total_distance_m'] - compare['optimal']['total_distance_m']:.1f} m"
+            )
+            st.metric(
+                "Tid i kø",
+                format_time(compare["optimal"]["total_wait_minutes"] * 60),
+                delta=f"{compare['baseline']['total_wait_minutes'] - compare['optimal']['total_wait_minutes']:.2f} min"
+            )
+
+        st.markdown("### 📈 Visualisering av optimal layout")
+        optimal_layout_df = compare["optimal"]["layout_df"]
+        fig_layout_opt, ax_layout_opt = plt.subplots(figsize=(10, 4))
+        ax_layout_opt.scatter(optimal_layout_df["x"], optimal_layout_df["y"], c="lightgreen", s=200)
+        for _, row in optimal_layout_df.iterrows():
+            ax_layout_opt.text(row["x"], row["y"], f"{int(row['lokasjon'])}", ha="center", va="center", fontsize=9, fontweight="bold")
+        ax_layout_opt.set_xlabel("X (m)")
+        ax_layout_opt.set_ylabel("Y (m)")
+        ax_layout_opt.set_title("Optimal layout fra assignment")
+        st.pyplot(fig_layout_opt)
