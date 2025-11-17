@@ -73,10 +73,22 @@ def test_build_plotly_animation_creates_frames():
     x_range = [layout_df["x"].min() - 1, layout_df["x"].max() + 1]
     y_range = [layout_df["y"].min() - 1, layout_df["y"].max() + 1]
 
-    fig = build_plotly_animation(mv, x_range, y_range)
+    fig = build_plotly_animation(mv, x_range, y_range, layout_df)
     fig_dict = fig.to_dict()
 
     assert len(fig_dict.get("frames", [])) > 0
     assert len(fig_dict.get("data", [])) > 0
     assert fig.layout.xaxis.range == tuple(x_range)
     assert fig.layout.yaxis.range == tuple(y_range)
+    assert len(fig.layout.shapes) == len(layout_df)
+
+    picker_texts = []
+    for trace in fig.data:
+        if trace.text is None:
+            continue
+        if isinstance(trace.text, (list, tuple)):
+            picker_texts.extend(trace.text)
+        else:
+            picker_texts.append(trace.text)
+
+    assert any("🧍" in str(text) for text in picker_texts)

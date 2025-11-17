@@ -8,6 +8,7 @@ import math
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 import plotly.express as px
+import plotly.graph_objects as go
 
 ###############################################################
 #               TIDSMODELL – VIKTIG!
@@ -409,13 +410,27 @@ def draw_frame(result, t_sel):
     return fig
 
 
-def build_plotly_animation(mv_plot, x_range, y_range):
+def _derive_zones(layout_df):
+    """Return a Series with a simple zone label per radiale rad i layouten."""
+
+    if "zone" in layout_df.columns:
+        return layout_df["zone"]
+
+    unique_rows = sorted(layout_df["y"].unique())
+    zone_names = {y: f"Sone {idx + 1}" for idx, y in enumerate(unique_rows)}
+    return layout_df["y"].map(zone_names)
+
+
+def build_plotly_animation(mv_plot, x_range, y_range, layout_df=None):
     mv_plot = mv_plot.copy()
     mv_plot["tid (min)"] = mv_plot["time"].round(2)
     mv_plot["marker_size"] = np.where(mv_plot["event"] == "pick", 16, 10)
+    mv_plot["ikon"] = mv_plot["picker"].apply(lambda p: f"🧍 P{p}")
     mv_plot.sort_values("time", inplace=True)
 
-    return px.scatter(
+    palette = px.colors.qualitative.Set3
+
+    fig = px.scatter(
         mv_plot,
         x="x",
         y="y",
@@ -425,12 +440,67 @@ def build_plotly_animation(mv_plot, x_range, y_range):
         animation_frame="tid (min)",
         animation_group="picker",
         size="marker_size",
-        size_max=18,
+        size_max=20,
         range_x=x_range,
         range_y=y_range,
         labels={"x": "X (m)", "y": "Y (m)", "picker": "Plukker"},
-        title="Plukkerbevegelser over tid"
+        title="Plukkerbevegelser over tid",
+        hover_name="ikon",
     )
+
+    fig.update_traces(
+        text=mv_plot["ikon"],
+        textposition="top center",
+        marker=dict(line=dict(color="black", width=1.2), symbol="circle"),
+        opacity=0.9,
+    )
+
+    if layout_df is not None and not layout_df.empty:
+        layout_with_zones = layout_df.copy()
+        layout_with_zones["zone"] = _derive_zones(layout_with_zones)
+
+        zone_palette = {
+            zone: palette[i % len(palette)]
+            for i, zone in enumerate(sorted(layout_with_zones["zone"].unique()))
+        }
+
+        shapes = []
+        for _, row in layout_with_zones.iterrows():
+            color = zone_palette.get(row["zone"], "#d6e9ff")
+            shapes.append(
+                dict(
+                    type="rect",
+                    x0=row["x"] - 0.6,
+                    x1=row["x"] + 0.6,
+                    y0=row["y"] - 0.6,
+                    y1=row["y"] + 0.6,
+                    line=dict(color="rgba(20, 20, 20, 0.6)", width=1.6),
+                    fillcolor=color,
+                    opacity=0.35,
+                    layer="below",
+                )
+            )
+
+        fig.update_layout(
+            shapes=shapes,
+            legend_title_text="Plukker (ikon)",
+            plot_bgcolor="#f9f9f9",
+            yaxis_scaleanchor="x",
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=layout_with_zones["x"],
+                y=layout_with_zones["y"],
+                mode="text",
+                text=[f"{int(row['lokasjon'])}<br>{row['zone']}" for _, row in layout_with_zones.iterrows()],
+                textfont=dict(color="#0a2f73", size=10),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    return fig
 
 
 ###############################################################
@@ -555,7 +625,9 @@ def main():
     
                     # PLOTLY-ANIMASJON
                     st.subheader("🎬 Interaktiv animasjon (Plotly)")
-                    fig_plotly = build_plotly_animation(mv, x_range, y_range)
+                    fig_plotly = build_plotly_animation(
+                        mv, x_range, y_range, result["layout_df"]
+                    )
                     st.plotly_chart(fig_plotly, use_container_width=True)
     
                     # ANIMASJON (MATPLOTLIB-SLIDER)
