@@ -1,4 +1,5 @@
 streamlit
+streamlit-drawable-canvas
 simpy
 pandas
 numpy
