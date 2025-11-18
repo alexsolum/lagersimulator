@@ -7,4 +7,3 @@ matplotlib
 plotly
 pytest
 uuid
-json
