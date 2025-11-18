@@ -6,3 +6,5 @@ openpyxl
 matplotlib
 plotly
 pytest
+uuid
+json
