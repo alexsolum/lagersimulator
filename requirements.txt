@@ -1,11 +1,8 @@
 streamlit
-streamlit-drawable-canvas
 simpy
 pandas
 numpy
 openpyxl
 matplotlib
 plotly
-pytest
-uuid
-st_aggrid
+st-aggrid
