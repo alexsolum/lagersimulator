@@ -8,3 +8,4 @@ matplotlib
 plotly
 pytest
 uuid
+st_aggrid
