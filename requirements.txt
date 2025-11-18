@@ -5,4 +5,4 @@ numpy
 openpyxl
 matplotlib
 plotly
-st-aggrid
+streamlit-aggrid
