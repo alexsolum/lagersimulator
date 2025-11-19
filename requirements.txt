@@ -2,7 +2,8 @@ streamlit
 simpy
 pandas
 numpy
-openpyxl
-matplotlib
 plotly
-streamlit-aggrid
+networkx
+ortools
+xlsxwriter
+openpyxl
